@@ -59,9 +59,9 @@ mark { background: var(--hl); color: inherit; border-radius: 3px; padding: 0 2px
     </div>
     <div class="files" id="files"></div>
     <div class="search">
-      <input id="q" type="search" placeholder="ناو بنووسە… (بۆ نموونە: عمر محمود)" autocomplete="off" autofocus>
+      <input id="q" type="search" placeholder="ناو یان ژمارەی تابلۆ… (عمر محمود، 27511)" autocomplete="off" autofocus>
       <select id="col" aria-label="گەڕان لە">
-        <option value="name">تەنها ستوونی ناوەکان</option>
+        <option value="name">ناو و ژمارەی تابلۆ</option>
         <option value="all">هەموو ستوونەکان</option>
       </select>
     </div>
@@ -111,24 +111,32 @@ function norm(s) {
 }
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 const NAME_RX = /اسم|ناو|name/i;
+// Plate-number columns, matched on the normalised header (e.g. «رقم العجلة», «ژمارەی تابلۆ», «لوحة»).
+const PLATE_RX = /رقم|لوحه|تابلو|ژمارهی|عجله|سیاره|اوتومبیل|plate|car/i;
 
 // One "table" per sheet: { file, sheet, header, rows, idx, nameCols }
 let tables = [];
 
 function makeTable(file, sheet, raw) {
-  const start = raw.findIndex(r => r.some(v => String(v).trim()));
+  // Header = the fullest of the first 10 rows, so a title line above the table is skipped.
+  const filled = r => r.filter(v => String(v).trim()).length;
+  let start = -1;
+  for (let i = 0; i < Math.min(10, raw.length); i++) if (filled(raw[i]) > (start < 0 ? 0 : filled(raw[start]))) start = i;
   if (start < 0) return null;
   const header = raw[start].map((h, i) => String(h).trim() || `ستوون ${i + 1}`);
   const rows = raw.slice(start + 1).filter(r => r.some(v => String(v).trim()));
   if (!rows.length) return null;
-  let nameCols = header.map((h, i) => NAME_RX.test(h) ? i : -1).filter(i => i >= 0);
+  let nameCols = header.map((h, i) => NAME_RX.test(norm(h)) ? i : -1).filter(i => i >= 0);
   if (!nameCols.length) nameCols = header.map((_, i) => i);
+  const plateCols = header.map((h, i) => !nameCols.includes(i) && PLATE_RX.test(norm(h)) ? i : -1).filter(i => i >= 0);
+  const searchCols = [...nameCols, ...plateCols];
   // Pre-normalised text per row, built once, so each keystroke is only a few string lookups.
   // \u0001 separates columns so a word can never run across two cells.
+  // Spaces are removed here so «عبدالله» finds «عبد الله» and the other way round.
   const idx = rows.map(r => r.map(norm));
-  const nameStr = idx.map(r => nameCols.map(c => r[c] || "").join("\u0001"));
-  const allStr = idx.map(r => r.join("\u0001"));
-  return { file, sheet, header, rows, idx, nameStr, allStr, nameCols };
+  const nameStr = idx.map(r => searchCols.map(c => r[c] || "").join("\u0001").replace(/ /g, ""));
+  const allStr = idx.map(r => r.join("\u0001").replace(/ /g, ""));
+  return { file, sheet, header, rows, idx, nameStr, allStr, nameCols, searchCols };
 }
 
 // --- Remember files between visits (IndexedDB; works without it too) ---
@@ -205,20 +213,21 @@ let prev = { q: null, mode: null, gen: 0, cand: null };
 let gen = 0;
 const PAGE = 50;
 function search() {
-  const q = norm($("q").value), mode = $("col").value;
+  const q = norm($("q").value);
+  let mode = $("col").value;
   const words = q.split(" ").filter(Boolean);
   const list = $("list");
   lastHits = []; shown = 0;
   if (!tables.length) { $("info").textContent = ""; list.innerHTML = ""; return; }
   if (!words.length) { $("info").textContent = "ناوێک بنووسە. دەتوانیت تەنها بەشێکی ناوەکە بنووسیت، وەک ناوی یەکەم و ناوی باوک."; list.innerHTML = ""; prev.q = null; return; }
   const phrase = words.join(" ");
-  const cand = [];
+  let cand = [];
   const test = (t, i) => {
     const hay = mode === "all" ? t.allStr[i] : t.nameStr[i];
     for (const w of words) if (!hay.includes(w)) return;
     // best: whole name found inside one single cell, in the typed order
     let best = 0;
-    for (const c of (mode === "all" ? t.idx[i].keys() : t.nameCols)) {
+    for (const c of (mode === "all" ? t.idx[i].keys() : t.searchCols)) {
       const v = t.idx[i][c] || "";
       if (v.startsWith(phrase)) { best = 3; break; }
       if (best < 2 && v.includes(phrase)) best = 2;
@@ -232,22 +241,28 @@ function search() {
     for (const t of tables) for (let i = 0; i < t.rows.length; i++) test(t, i);
   }
   prev = { q: phrase, mode, gen, cand };
+  // Nothing in the name columns: look in every column before giving up.
+  let widened = false;
+  if (!cand.length && mode === "name") {
+    mode = "all"; widened = true; cand = [];
+    for (const t of tables) for (let i = 0; i < t.rows.length; i++) test(t, i);
+  }
   lastHits = cand.slice().sort((a, b) => b.score - a.score);
   const n = lastHits.length;
-  $("info").textContent = n ? `${n.toLocaleString("en")} ئەنجام دۆزرایەوە` : "هیچ ناوێک نەدۆزرایەوە. ڕێنووسێکی تر یان تەنها ناوی یەکەم تاقی بکەرەوە.";
+  $("info").textContent = n ? `${n.toLocaleString("en")} ئەنجام دۆزرایەوە${widened ? " (لە ستوونەکانی تردا)" : ""}` : "هیچ ناوێک نەدۆزرایەوە. ڕێنووسێکی تر یان تەنها ناوی یەکەم تاقی بکەرەوە.";
   list.innerHTML = "";
-  showMore(words);
+  showMore(words, widened ? "all" : $("col").value);
 }
-let curWords = [];
-function showMore(words) {
-  if (words) curWords = words;
-  const mode = $("col").value;
+let curWords = [], curMode = "name";
+function showMore(words, m) {
+  if (words) { curWords = words; curMode = m; }
+  const mode = curMode;
   const old = $("more"); if (old) old.remove();
   const from = shown; shown = Math.min(lastHits.length, shown + PAGE);
   const html = lastHits.slice(from, shown).map((h, j) => {
     const k = from + j, words = curWords;
     const { t, i } = h, r = t.rows[i];
-    const hlCols = mode === "all" ? null : new Set(t.nameCols);
+    const hlCols = mode === "all" ? null : new Set(t.searchCols);
     const cells = t.header.map((name, c) => {
       const s = String(r[c] ?? "").trim();
       const latin = /^[\sA-Za-z0-9\-\/.]+$/.test(s);
